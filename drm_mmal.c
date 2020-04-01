@@ -1,4 +1,9 @@
 /*
+ * Forked from 6by9/drm_mmal
+ *
+ * I modified the original code to take the video stream from the Pi camera.
+ */
+/*
 Copyright (c) 2017 Raspberry Pi (Trading) Ltd
 
 Based on example_basic_2.c from the Userland repo (interface/mmal/test/examples)
@@ -94,6 +99,7 @@ static inline int warn(const char *file, int line, const char *fmt, ...)
    vfprintf(stderr, fmt, va);
    va_end(va);
    errno = errsv;
+   fprintf(stderr, "\n");
    return 1;
 }
 
@@ -154,62 +160,6 @@ struct drm_setup {
    MMAL_RECT_T compose;
 };
 
-
-static void log_format(MMAL_ES_FORMAT_T *format, MMAL_PORT_T *port)
-{
-   const char *name_type;
-
-   if(port)
-      fprintf(stderr, "%s:%s:%i", port->component->name,
-               port->type == MMAL_PORT_TYPE_CONTROL ? "ctr" :
-                  port->type == MMAL_PORT_TYPE_INPUT ? "in" :
-                  port->type == MMAL_PORT_TYPE_OUTPUT ? "out" : "invalid",
-               (int)port->index);
-
-   switch(format->type)
-   {
-   case MMAL_ES_TYPE_AUDIO: name_type = "audio"; break;
-   case MMAL_ES_TYPE_VIDEO: name_type = "video"; break;
-   case MMAL_ES_TYPE_SUBPICTURE: name_type = "subpicture"; break;
-   default: name_type = "unknown"; break;
-   }
-
-   fprintf(stderr, "type: %s, fourcc: %4.4s\n", name_type, (char *)&format->encoding);
-   fprintf(stderr, " bitrate: %i, framed: %i\n", format->bitrate,
-            !!(format->flags & MMAL_ES_FORMAT_FLAG_FRAMED));
-   fprintf(stderr, " extra data: %i, %p\n", format->extradata_size, format->extradata);
-   switch(format->type)
-   {
-   case MMAL_ES_TYPE_AUDIO:
-      fprintf(stderr, " samplerate: %i, channels: %i, bps: %i, block align: %i\n",
-               format->es->audio.sample_rate, format->es->audio.channels,
-               format->es->audio.bits_per_sample, format->es->audio.block_align);
-      break;
-
-   case MMAL_ES_TYPE_VIDEO:
-      fprintf(stderr, " width: %i, height: %i, (%i,%i,%i,%i)\n",
-               format->es->video.width, format->es->video.height,
-               format->es->video.crop.x, format->es->video.crop.y,
-               format->es->video.crop.width, format->es->video.crop.height);
-      fprintf(stderr, " pixel aspect ratio: %i/%i, frame rate: %i/%i\n",
-               format->es->video.par.num, format->es->video.par.den,
-               format->es->video.frame_rate.num, format->es->video.frame_rate.den);
-      break;
-
-   case MMAL_ES_TYPE_SUBPICTURE:
-      break;
-
-   default: break;
-   }
-
-   if(!port)
-      return;
-
-   fprintf(stderr, " buffers num: %i(opt %i, min %i), size: %i(opt %i, min: %i), align: %i\n",
-            port->buffer_num, port->buffer_num_recommended, port->buffer_num_min,
-            port->buffer_size, port->buffer_size_recommended, port->buffer_size_min,
-            port->buffer_alignment_min);
-}
 
 uint32_t mmal_encoding_to_drm_fourcc(uint32_t mmal_encoding)
 {
@@ -350,6 +300,7 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
       goto fail_vcsm;
    }
 
+   printf("SUCCESS: buffer_create\n");
    return 0;
 
 fail_vcsm:
@@ -389,6 +340,7 @@ MMAL_POOL_T* pool_create_drm(MMAL_PORT_T *port, struct buffer *buffers, int drmf
       buffers[i].mmal_buffer = pool->header[i];
    }
 
+   printf("SUCCESS: pool_create_drm\n");
    return pool;
 }
 
@@ -588,35 +540,16 @@ static int find_plane(int drmfd, struct drm_setup *s)
 }
 
 
-/** Callback from the input port.
- * Buffer has been consumed and is available to be used again. */
-static void input_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
-{
-   struct CONTEXT_T *ctx = (struct CONTEXT_T *)port->userdata;
-
-   /* The decoder is done with the data, just recycle the buffer header into its pool */
-   mmal_buffer_header_release(buffer);
-
-   /* Kick the processing thread */
-   vcos_semaphore_post(&ctx->semaphore);
-}
-
 /** Callback from the output port.
  * Buffer has been produced by the port and is available for processing. */
 static void output_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
 {
    struct CONTEXT_T *ctx = (struct CONTEXT_T *)port->userdata;
    /* Queue the decoded video frame */
-   //fprintf(stderr, "Buffer %p returned cmd %08X, length %u\n", buffer, buffer->cmd, buffer->length);
+   fprintf(stderr, "Buffer %p returned cmd %08X, length %u\n", buffer, buffer->cmd, buffer->length);
    mmal_queue_put(ctx->queue, buffer);
 
    /* Kick the processing thread */
-   vcos_semaphore_post(&ctx->semaphore);
-}
-
-static void drm_mmal_connection_cb(MMAL_CONNECTION_T *connection)
-{
-   struct CONTEXT_T *ctx = (struct CONTEXT_T *)connection->user_data;
    vcos_semaphore_post(&ctx->semaphore);
 }
 
@@ -624,14 +557,18 @@ static int drm_mmal_create_buffers(MMAL_PORT_T *port, struct buffer *buffers, in
 {
    MMAL_STATUS_T status;
    port->buffer_size = port->buffer_size_min;
-   printf("Set buffer size to %d\n", port->buffer_size);
+   printf("Set port buffer size to %d\n", port->buffer_size);
    status = mmal_port_format_commit(port);
 
    *pool_out = pool_create_drm(port,
                               buffers, drmfd);
 
+   // Note. buffer_num must be set before you get here 
+   // 6by9: "The GPU allocates on port enable, so any changes afterwards are going to be bad news."
+   printf("About to enable port %s\n", port->name);
    status = mmal_port_enable(port, output_callback);
    CHECK_STATUS(status, "failed to enable port");
+   printf("SUCCESS: drm_mmal_create_buffers\n");
    return 0;
 error:
    return status;
@@ -665,102 +602,55 @@ error:
    return status;
 }
 
-int main(int argc, char **argv)
+static int setup_camera_config(MMAL_COMPONENT_T* camera, const int Width, const int Height)
 {
-   MMAL_STATUS_T status = MMAL_EINVAL;
-   MMAL_COMPONENT_T *decoder = NULL, *isp = NULL;
-   MMAL_POOL_T *pool_in = NULL, *pool_out = NULL;
-   MMAL_BOOL_T eos_sent = MMAL_FALSE, eos_received = MMAL_FALSE;
-   struct drm_setup setup = {0};
-   struct buffer buffers[MAX_BUFFERS];
-   MMAL_BUFFER_HEADER_T *current_buffer = NULL;
-   MMAL_CONNECTION_T *connection = NULL;
-   unsigned int in_count = 0, conn_out_count = 0, conn_in_count = 0, out_count = 0;
-   int ret;
+    MMAL_PARAMETER_CAMERA_CONFIG_T cam_config = {
+        { MMAL_PARAMETER_CAMERA_CONFIG, sizeof(cam_config) },
+        .max_stills_w = Width,
+        .max_stills_h = Height,
+        .stills_yuv422 = 0,
+        .one_shot_stills = 0,
+        .max_preview_video_w = Width,
+        .max_preview_video_h = Height,
+        .num_preview_video_frames = 3,
+        .stills_capture_circular_buffer_height = 0,
+        .fast_preview_resume = 0,
+        .use_stc_timestamp = MMAL_PARAM_TIMESTAMP_MODE_RESET_STC
+    };
 
-   if (argc < 2)
-   {
-      fprintf(stderr, "invalid arguments\n");
-      return -1;
-   }
+    MMAL_STATUS_T status = mmal_port_parameter_set(camera->control, &cam_config.hdr);
+    CHECK_STATUS(status, "failed to set camera config");
 
-   bcm_host_init();
+error:
+   return status;
+}
 
-   int drmfd = drmOpen(DRM_MODULE, NULL);
-   CHECK_CONDITION(drmfd < 0, "drmOpen(%s) failed: %s\n", DRM_MODULE, ERRSTR);
 
-   vcsm_init();
+static int setup_port_format(MMAL_PORT_T* port, const int Width, const int Height)
+{
+   port->userdata = (void *)&context;
+   port->buffer_num = 3;
+   //camera->output[output_port]->buffer_size = camera->output[output_port]->buffer_size_recommended;
 
-   vcos_semaphore_create(&context.semaphore, "example", 1);
+   MMAL_ES_FORMAT_T *format_out = port->format;
 
-   SOURCE_OPEN(argv[1]);
+   //format_out->encoding = MMAL_ENCODING_OPAQUE;
+   format_out->encoding = ENCODING_FOR_DRM;
+   format_out->encoding_variant = MMAL_ENCODING_I420;
+    format_out->es->video.width = VCOS_ALIGN_UP(Width,32);
+    format_out->es->video.height = VCOS_ALIGN_UP(Height,16);
+    format_out->es->video.crop.x = 0;
+    format_out->es->video.crop.y = 0;
+    format_out->es->video.crop.width = Width;
+    format_out->es->video.crop.height = Height;
+    format_out->es->video.frame_rate.num = 0;  // 0 means variable frame rate
+    format_out->es->video.frame_rate.den = 1;
 
-   /* Create the decoder component.
-    * This specific component exposes 2 ports (1 input and 1 output). Like most components
-    * its expects the format of its input port to be set by the client in order for it to
-    * know what kind of data it will be fed. */
-   status = mmal_component_create(MMAL_COMPONENT_DEFAULT_VIDEO_DECODER, &decoder);
-   CHECK_STATUS(status, "failed to create decoder");
-
-   status = mmal_component_create("vc.ril.isp", &isp);
-   CHECK_STATUS(status, "failed to create isp");
-
-   /* Enable control port so we can receive events from the component */
-   decoder->control->userdata = (void *)&context;
-   status = mmal_port_enable(decoder->control, control_callback);
-   CHECK_STATUS(status, "failed to enable control port");
-
-   /* Set the zero-copy parameter on the input port */
-   status = mmal_port_parameter_set_boolean(decoder->input[0], MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
-   CHECK_STATUS(status, "failed to set zero copy - %s", decoder->input[0]->name);
-
-   /* Set the zero-copy parameter on the output port */
-   status = mmal_port_parameter_set_boolean(decoder->output[0], MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
-   CHECK_STATUS(status, "failed to set zero copy - %s", decoder->output[0]->name);
-
-   status = mmal_port_parameter_set_boolean(isp->input[0], MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
-   CHECK_STATUS(status, "failed to set zero copy - %s", isp->input[0]->name);
-
-   status = mmal_port_parameter_set_boolean(isp->output[0], MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
-   CHECK_STATUS(status, "failed to set zero copy - %s", isp->output[0]->name);
-
-   /* Set format of video decoder input port */
-   MMAL_ES_FORMAT_T *format_in = decoder->input[0]->format;
-   format_in->type = MMAL_ES_TYPE_VIDEO;
-   format_in->encoding = MMAL_ENCODING_H264;
-   format_in->es->video.width = 1280;
-   format_in->es->video.height = 720;
-   format_in->es->video.frame_rate.num = 30;
-   format_in->es->video.frame_rate.den = 1;
-   format_in->es->video.par.num = 1;
-   format_in->es->video.par.den = 1;
-   /* If the data is known to be framed then the following flag should be set:
-    * format_in->flags |= MMAL_ES_FORMAT_FLAG_FRAMED; */
-
-   SOURCE_READ_CODEC_CONFIG_DATA(codec_header_bytes, codec_header_bytes_size);
-   status = mmal_format_extradata_alloc(format_in, codec_header_bytes_size);
-   CHECK_STATUS(status, "failed to allocate extradata");
-   format_in->extradata_size = codec_header_bytes_size;
-   if (format_in->extradata_size)
-      memcpy(format_in->extradata, codec_header_bytes, format_in->extradata_size);
-
-   status = mmal_port_format_commit(decoder->input[0]);
+   MMAL_STATUS_T status = mmal_port_format_commit(port);
    CHECK_STATUS(status, "failed to commit format");
-
-   MMAL_ES_FORMAT_T *format_out = decoder->output[0]->format;
-   format_out->encoding = MMAL_ENCODING_OPAQUE;
-
-   status = mmal_port_format_commit(decoder->output[0]);
-   CHECK_STATUS(status, "failed to commit format");
-
-   status = mmal_connection_create(&connection, decoder->output[0], isp->input[0], 0);
-   CHECK_STATUS(status, "failed to create connection");
-
-   (*connection).callback = drm_mmal_connection_cb;
-   (*connection).user_data = (void *)&context;
 
    /* Display the output port format */
-   fprintf(stderr, "%s\n", decoder->output[0]->name);
+   fprintf(stderr, "%s\n", port->name);
    fprintf(stderr, " type: %i, fourcc: %4.4s\n", format_out->type, (char *)&format_out->encoding);
    fprintf(stderr, " bitrate: %i, framed: %i\n", format_out->bitrate,
            !!(format_out->flags & MMAL_ES_FORMAT_FLAG_FRAMED));
@@ -770,51 +660,113 @@ int main(int argc, char **argv)
            format_out->es->video.crop.x, format_out->es->video.crop.y,
            format_out->es->video.crop.width, format_out->es->video.crop.height);
 
-   /* The format of both ports is now set so we can get their buffer requirements and create
-    * our buffer headers. We use the buffer pool API to create these. */
-   decoder->input[0]->buffer_num = decoder->input[0]->buffer_num_min;
-   decoder->input[0]->buffer_size = decoder->input[0]->buffer_size_min;
-   decoder->output[0]->buffer_num = decoder->output[0]->buffer_num_recommended;
-   decoder->output[0]->buffer_size = decoder->output[0]->buffer_size_min;
-   pool_in = mmal_port_pool_create(decoder->input[0],
-                                   decoder->input[0]->buffer_num,
-                                   decoder->input[0]->buffer_size);
+error:
+   return status;
+}
+
+int main(int argc, char **argv)
+{
+   const int Width = 3280;
+   //const int Width = 1920;
+   const int Height = 2464;
+   //const int Height = 1080;
+
+   MMAL_STATUS_T status = MMAL_EINVAL;
+   MMAL_COMPONENT_T *camera = NULL;
+   MMAL_COMPONENT_T* null_sink_component = NULL;
+   MMAL_CONNECTION_T* preview_connection = NULL;  // Only used to connect preview to the null sink
+   MMAL_POOL_T *pool_out = NULL;
+   MMAL_BOOL_T eos_sent = MMAL_FALSE, eos_received = MMAL_FALSE;
+   struct drm_setup setup = {0};
+   struct buffer buffers[MAX_BUFFERS];
+   MMAL_BUFFER_HEADER_T *current_buffer = NULL;
+   unsigned int in_count = 0, conn_out_count = 0, conn_in_count = 0, out_count = 0;
+   int ret;
+
+   // Usage ./drm_mmal [0,1,2]
+   if (argc < 2)
+   {
+      fprintf(stderr, "Usage: ./drm_mmal [0,1,2]  # Specify which camera port to use\n");
+      return -1;
+   }
+   const int output_port = atoi(argv[1]);  // 0 == Preview, 1 == Video stream, 2 == Still camera.
+
+   bcm_host_init();
+   printf("SUCCESS: bcm_host_init\n");
+
+   int drmfd = drmOpen(DRM_MODULE, NULL);
+   CHECK_CONDITION(drmfd < 0, "drmOpen(%s) failed: %s\n", DRM_MODULE, ERRSTR);
+
+   vcsm_init();
+   printf("SUCCESS: vcsm_init\n");
+
+   vcos_semaphore_create(&context.semaphore, "example", 1);
+   printf("SUCCESS: vcos_semaphore_create\n");
+
+   status = mmal_component_create(MMAL_COMPONENT_DEFAULT_CAMERA, &camera);
+   CHECK_STATUS(status, "failed to create camera");
+
+   /* Enable control port so we can receive events from the component */
+   camera->control->userdata = (void *)&context;
+   status = mmal_port_enable(camera->control, control_callback);
+   CHECK_STATUS(status, "failed to enable control port");
+
+   setup_camera_config(camera, Width, Height);
+
+   /* Set the zero-copy parameter on all camera ports */
+   for (int index = 0; index !=3; ++index)
+   {
+      status = mmal_port_parameter_set_boolean(camera->output[index], MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
+      CHECK_STATUS(status, "failed to set zero copy - %s", camera->output[output_port]->name);
+   }
+
+   setup_port_format(camera->output[0], Width, Height);
+   if (output_port != 0)
+   {
+      setup_port_format(camera->output[output_port], Width, Height);
+   }
 
    /* Create a queue to store our decoded video frames. The callback we will get when
     * a frame has been decoded will put the frame into this queue. */
    context.queue = mmal_queue_create();
 
-   /* Store a reference to our context in each port (will be used during callbacks) */
-   decoder->input[0]->userdata = (void *)&context;
-
-   /* Enable all the input port and the output port.
-    * The callback specified here is the function which will be called when the buffer header
-    * we sent to the component has been processed. */
-   status = mmal_port_enable(decoder->input[0], input_callback);
-   CHECK_STATUS(status, "failed to enable input port");
-   status = mmal_connection_enable(connection);
-   CHECK_STATUS(status, "failed to enable connection");
-
    /* Component won't start processing data until it is enabled. */
-   status = mmal_component_enable(decoder);
-   CHECK_STATUS(status, "failed to enable decoder component");
+   status = mmal_component_enable(camera);
+   CHECK_STATUS(status, "failed to enable camera component");
 
-   status = mmal_component_enable(isp);
-   CHECK_STATUS(status, "failed to enable isp component");
+   // If the output_port is not the preview port then connect the preview port to the null sink
+   // The camera preview port must be connected to something for calculating exposure and white balance settings.
 
-   isp->output[0]->userdata = (void *)&context;
-   mmal_format_full_copy(isp->output[0]->format, isp->input[0]->format);
-   isp->output[0]->format->encoding = ENCODING_FOR_DRM;
+   if (output_port != 0)
+   {
+      status = mmal_port_parameter_set_boolean(camera->output[output_port], MMAL_PARAMETER_CAPTURE, 1);
+      CHECK_STATUS(status, "Failed to start capture");
 
-   status = mmal_port_format_commit(isp->output[0]);
-   CHECK_STATUS(status, "failed to set ISP output format");
-   isp->output[0]->buffer_num = MAX_BUFFERS;
-   isp->output[0]->buffer_size = isp->output[0]->buffer_size_min;
+      status = mmal_component_create("vc.null_sink", &null_sink_component);
+      CHECK_STATUS(status, "failed to create null sink component");
 
-   status = mmal_port_enable(isp->output[0], output_callback);
-   CHECK_STATUS(status, "failed to enable isp output port");
+      status = mmal_component_enable(null_sink_component);
+      CHECK_STATUS(status, "failed to enable null sink component");
 
-   pool_out = pool_create_drm(isp->output[0], buffers, drmfd);
+      status = mmal_connection_create(&preview_connection, camera->output[0], null_sink_component->input[0],
+                                MMAL_CONNECTION_FLAG_TUNNELLING | MMAL_CONNECTION_FLAG_ALLOCATION_ON_INPUT);
+      CHECK_STATUS(status, "failed to create preview connection");
+
+      // The format of the two ports must have been committed before calling this function, although note that on creation, the connection automatically copies and commits the output port's format to the input port.
+      status = mmal_connection_enable(preview_connection);
+      CHECK_STATUS(status, "failed to enable preview connection");
+
+      // output_port is enabled during drm_mmal_create_buffers
+      if (!camera->output[0]->is_enabled)
+      {
+        status = mmal_port_enable(camera->output[0], output_callback);
+        CHECK_STATUS(status, "failed to enable port 0");
+      }
+
+      printf("Connected preview port to null sink\n");
+      // TODO: somewhere else, delete/destroy/release all these bits and pieces.
+   }
+
    setup.out_fourcc = mmal_encoding_to_drm_fourcc(ENCODING_FOR_DRM);
 
    uint32_t con;
@@ -824,9 +776,32 @@ int main(int argc, char **argv)
    ret = find_plane(drmfd, &setup);
    CHECK_CONDITION(ret, "failed to find compatible plane\n");
 
+   printf("Calling drm_mmal_craete_buffers with output_port = %i\n",output_port);
+   status = drm_mmal_create_buffers(camera->output[output_port], buffers, drmfd, &pool_out);
+   CHECK_STATUS(status, "failed to drm_mmal_create_buffers");
+
+   pool_out = pool_create_drm(camera->output[output_port], buffers, drmfd);
+    {
+		int num = mmal_queue_length(pool_out->queue);
+		int q;
+		for (q=0;q<num;q++)
+		{
+			MMAL_BUFFER_HEADER_T *buffer = mmal_queue_get(pool_out->queue);
+			if (!buffer)
+			{
+				printf("Unable to get a required buffer %d from pool queue\n\n", q);
+				exit(1);
+			}
+			else if ( (status=mmal_port_send_buffer(camera->output[output_port], buffer))!= MMAL_SUCCESS)
+			{
+				printf("Unable to send a buffer to port (%d).  Status=(%d)\n\n", q,status);
+				exit(1);
+			}
+		}
+	}
 
    /* Start decoding */
-   fprintf(stderr, "start decoding\n");
+   fprintf(stderr, "start main loop\n");
 
    /* This is the main processing loop */
    while(!eos_received && out_count < 10000)
@@ -834,104 +809,10 @@ int main(int argc, char **argv)
       MMAL_BUFFER_HEADER_T *buffer;
       VCOS_STATUS_T vcos_status;
 
-      /* Wait for buffer headers to be available on either of the decoder ports */
+      /* Wait for buffer headers to be available on either of the camera ports */
       vcos_status = vcos_semaphore_wait_timeout(&context.semaphore, 2000);
       if (vcos_status != VCOS_SUCCESS)
          fprintf(stderr, "vcos_semaphore_wait_timeout failed - status %d\n", vcos_status);
-
-      /* Check for errors */
-      if (context.status != MMAL_SUCCESS)
-         break;
-
-      /* Send data to decode to the input port of the video decoder */
-      if (!eos_sent && (buffer = mmal_queue_get(pool_in->queue)) != NULL)
-      {
-         SOURCE_READ_DATA_INTO_BUFFER(buffer);
-         if(!buffer->length) eos_sent = MMAL_TRUE;
-
-         buffer->flags = buffer->length ? 0 : MMAL_BUFFER_HEADER_FLAG_EOS;
-         buffer->pts = buffer->dts = MMAL_TIME_UNKNOWN;
-         //fprintf(stderr, "sending %i bytes\n", (int)buffer->length);
-         status = mmal_port_send_buffer(decoder->input[0], buffer);
-         CHECK_STATUS(status, "failed to send buffer");
-         in_count++;
-         //fprintf(stderr, "Input buffer %p to port %s. in_count %u\n", buffer, decoder->input[0]->name, in_count);
-      }
-
-      /* Get buffers from the connection */
-      while ((buffer = mmal_queue_get(connection->queue)) != NULL)
-      {
-         conn_out_count++;
-         //fprintf(stderr, "Connection buffer %p to port %s. conn_out_count %u\n", buffer, connection->in->name, conn_out_count);
-         if (buffer->cmd)
-         {
-            fprintf(stderr, "received event %4.4s\n", (char *)&buffer->cmd);
-            if (buffer->cmd == MMAL_EVENT_FORMAT_CHANGED)
-            {
-               MMAL_EVENT_FORMAT_CHANGED_T *event = mmal_event_format_changed_get(buffer);
-               if (event)
-               {
-                  fprintf(stderr, "----------Port format changed----------\n");
-                  log_format(decoder->output[0]->format, decoder->output[0]);
-                  fprintf(stderr, "-----------------to---------------------\n");
-                  log_format(event->format, 0);
-                  fprintf(stderr, " buffers num (opt %i, min %i), size (opt %i, min: %i)\n",
-                           event->buffer_num_recommended, event->buffer_num_min,
-                           event->buffer_size_recommended, event->buffer_size_min);
-                  fprintf(stderr, "----------------------------------------\n");
-               }
-
-               status = mmal_connection_event_format_changed(connection, buffer);
-               //Assume we can't reuse the output buffers, so have to disable, destroy
-               //pool, create new pool, enable port, feed in buffers.
-               status = drm_mmal_destroy_buffers(isp->output[0], buffers, drmfd, pool_out);
-
-               status = mmal_format_full_copy(isp->output[0]->format, event->format);
-               isp->output[0]->format->encoding = ENCODING_FOR_DRM;
-               isp->output[0]->buffer_num = MAX_BUFFERS;
-               isp->output[0]->buffer_size = isp->output[0]->buffer_size_min;
-
-               if (status == MMAL_SUCCESS)
-                  status = mmal_port_format_commit(isp->output[0]);
-               if (status != MMAL_SUCCESS)
-               {
-                  fprintf(stderr, "commit failed on output - %d\n", status);
-               }
-
-               status = drm_mmal_create_buffers(isp->output[0], buffers, drmfd, &pool_out);
-            }
-            mmal_buffer_header_release(buffer);
-            continue;
-         }
-
-         status = mmal_port_send_buffer(connection->in, buffer);
-         if (status != MMAL_SUCCESS)
-         {
-            fprintf(stderr, "mmal_port_send_buffer failed (%i)\n", status);
-            mmal_queue_put_back(connection->queue, buffer);
-            goto error;
-         }
-         buffer = mmal_queue_get(connection->queue);
-      }
-
-      /* Send empty buffers to the output port of the connection */
-      if (connection->pool)
-      {
-         while ((buffer = mmal_queue_get(connection->pool->queue)) != NULL)
-         {
-            //fprintf(stderr, "Returning buffer %p to port %s. conn_in_count %u\n", buffer, connection->out->name, conn_in_count);
-
-            status = mmal_port_send_buffer(connection->out, buffer);
-            if (status != MMAL_SUCCESS)
-            {
-               fprintf(stderr, "mmal_port_send_buffer failed (%i)\n", status);
-               mmal_queue_put_back(connection->pool->queue, buffer);
-               goto error;
-            }
-            buffer = mmal_queue_get(connection->pool->queue);
-            conn_in_count++;
-         }
-      }
 
       /* Get our output frames */
       while ((buffer = mmal_queue_get(context.queue)) != NULL)
@@ -953,9 +834,9 @@ int main(int argc, char **argv)
          }
          else
          {
-            int index;
+            int index=0;
 
-            //fprintf(stderr, "decoded frame (flags %x) count %d\n", buffer->flags, out_count);
+            fprintf(stderr, "decoded frame (flags %x) count %d\n", buffer->flags, out_count);
             if (buffer)
             {
                unsigned int i;
@@ -980,8 +861,8 @@ int main(int argc, char **argv)
                         setup.compose.width,
                         setup.compose.height,
                         0, 0,
-                        isp->output[0]->format->es->video.crop.width << 16,
-                        isp->output[0]->format->es->video.crop.height << 16);
+                        camera->output[output_port]->format->es->video.crop.width << 16,
+                        camera->output[output_port]->format->es->video.crop.height << 16);
             CHECK_CONDITION(ret, "drmModeSetPlane failed: %s\n", ERRSTR);
 
             //Release buffer that was on the screen
@@ -993,12 +874,12 @@ int main(int argc, char **argv)
          }
       }
 
-      /* Send empty buffers to the output port of the decoder */
+      /* Send empty buffers to the output port of the camera */
       while ((buffer = mmal_queue_get(pool_out->queue)) != NULL)
       {
          //printf("Sending buf %p\n", buffer);
-         status = mmal_port_send_buffer(isp->output[0], buffer);
-         CHECK_STATUS(status, "failed to send buffer to isp");
+         status = mmal_port_send_buffer(camera->output[output_port], buffer);
+         CHECK_STATUS(status, "failed to send buffer to camera");
       }
    }
 
@@ -1007,25 +888,32 @@ int main(int argc, char **argv)
 
    /* Stop everything. Not strictly necessary since mmal_component_destroy()
     * will do that anyway */
-   mmal_port_disable(decoder->input[0]);
-   mmal_port_disable(decoder->output[0]);
-   mmal_component_disable(decoder);
+   if (output_port != 0 && camera->output[0]->is_enabled)
+   {
+      mmal_port_disable(camera->output[0]);
+   }
+   mmal_component_disable(camera);
 
  error:
    /* Cleanup everything */
-   if (pool_in)
-      mmal_port_pool_destroy(decoder->input[0], pool_in);
-   if (connection)
+   if (preview_connection)
+    {
+        mmal_connection_disable(preview_connection);
+        mmal_connection_destroy(preview_connection);
+        preview_connection = NULL;
+    }
+   if (null_sink_component)
    {
-      mmal_connection_disable(connection);
-      mmal_connection_destroy(connection);
+        mmal_component_disable(null_sink_component);
+        mmal_component_destroy(null_sink_component);
+        null_sink_component = NULL;
    }
+
+   status = drm_mmal_destroy_buffers(camera->output[output_port], buffers, drmfd, pool_out);
    if (pool_out)
-      pool_destroy_drm(isp->output[0], pool_out, buffers, drmfd);
-   if (decoder)
-      mmal_component_destroy(decoder);
-   if (isp)
-      mmal_component_destroy(isp);
+      pool_destroy_drm(camera->output[output_port], pool_out, buffers, drmfd);
+   if (camera)
+      mmal_component_destroy(camera);
    if (context.queue)
       mmal_queue_destroy(context.queue);
 
