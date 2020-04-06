@@ -708,10 +708,12 @@ int main(int argc, char **argv)
    status = mmal_component_create(MMAL_COMPONENT_DEFAULT_CAMERA, &camera);
    CHECK_STATUS(status, "failed to create camera");
 
+#if 0
    /* Enable control port so we can receive events from the component */
    camera->control->userdata = (void *)&context;
    status = mmal_port_enable(camera->control, control_callback);
    CHECK_STATUS(status, "failed to enable control port");
+#endif
 
    setup_camera_config(camera, Width, Height);
 
