@@ -88,7 +88,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define ENCODING_FOR_DRM  MMAL_ENCODING_I420
 
 #define DRM_MODULE "vc4"
-#define MAX_BUFFERS 3
+#define MAX_BUFFERS 2
 
 static inline int warn(const char *file, int line, const char *fmt, ...)
 {
@@ -258,6 +258,7 @@ static int buffer_create(struct buffer *b, int drmfd, MMAL_PORT_T *port)
       printf("CREATE_DUMB failed: %s\n", ERRSTR);
       return -1;
    }
+   printf("SUCCESS: CREATE_DUMB\n");
    printf("bo %u %ux%u bpp %u size %lu (%u)\n", gem.handle, gem.width, gem.height, gem.bpp, (long)gem.size, port->buffer_size);
    b->bo_handle = gem.handle;
 
@@ -555,6 +556,7 @@ static void output_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
 
 static int drm_mmal_create_buffers(MMAL_PORT_T *port, struct buffer *buffers, int drmfd, MMAL_POOL_T **pool_out)
 {
+   printf("Entering: drm_mmal_create_buffers\n");
    MMAL_STATUS_T status;
    port->buffer_size = port->buffer_size_min;
    printf("Set port buffer size to %d\n", port->buffer_size);
@@ -779,26 +781,6 @@ int main(int argc, char **argv)
    printf("Calling drm_mmal_craete_buffers with output_port = %i\n",output_port);
    status = drm_mmal_create_buffers(camera->output[output_port], buffers, drmfd, &pool_out);
    CHECK_STATUS(status, "failed to drm_mmal_create_buffers");
-
-   pool_out = pool_create_drm(camera->output[output_port], buffers, drmfd);
-    {
-		int num = mmal_queue_length(pool_out->queue);
-		int q;
-		for (q=0;q<num;q++)
-		{
-			MMAL_BUFFER_HEADER_T *buffer = mmal_queue_get(pool_out->queue);
-			if (!buffer)
-			{
-				printf("Unable to get a required buffer %d from pool queue\n\n", q);
-				exit(1);
-			}
-			else if ( (status=mmal_port_send_buffer(camera->output[output_port], buffer))!= MMAL_SUCCESS)
-			{
-				printf("Unable to send a buffer to port (%d).  Status=(%d)\n\n", q,status);
-				exit(1);
-			}
-		}
-	}
 
    /* Start decoding */
    fprintf(stderr, "start main loop\n");
