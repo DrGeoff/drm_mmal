@@ -721,7 +721,7 @@ int main(int argc, char **argv)
    for (int index = 0; index !=3; ++index)
    {
       status = mmal_port_parameter_set_boolean(camera->output[index], MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
-      CHECK_STATUS(status, "failed to set zero copy - %s", camera->output[output_port]->name);
+      CHECK_STATUS(status, "failed to set zero copy - %s", camera->output[index]->name);
    }
 
    setup_port_format(camera->output[0], Width, Height);
